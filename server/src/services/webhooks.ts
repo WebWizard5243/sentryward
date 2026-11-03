@@ -16,16 +16,26 @@ export function webhookUrl(provider: string, repositoryId: string): string {
 export async function ensureWebhook(repo: Repository, connection: ForgeConnection): Promise<WebhookState> {
   const appState = providerFor(connection.provider).appWebhook?.(connection);
   if (appState) return appState;
-  if (repo.webhookId) return { active: true };
 
-  const secret = randomBytes(32).toString("hex");
   try {
-    const webhookId = await adapterForConnection(connection).createHook(repo, webhookUrl(repo.provider, repo.id), secret);
-    await prisma.repository.update({
-      where: { id: repo.id },
-      data: { webhookId, encryptedWebhookSecret: encrypt(secret) },
-    });
-    return { active: true };
+    return await prisma.$transaction(
+      async (tx) => {
+        // One request at a time per repository; others wait here.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${repo.id}))`;
+        // Re-read: another request may have saved a hook while this one waited.
+        const current = await tx.repository.findUnique({ where: { id: repo.id }, select: { webhookId: true } });
+        if (current?.webhookId) return { active: true };
+
+        const secret = randomBytes(32).toString("hex");
+        const webhookId = await adapterForConnection(connection).createHook(repo, webhookUrl(repo.provider, repo.id), secret);
+        await tx.repository.update({
+          where: { id: repo.id },
+          data: { webhookId, encryptedWebhookSecret: encrypt(secret) },
+        });
+        return { active: true };
+      },
+      { timeout: 30_000 },
+    );
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return {

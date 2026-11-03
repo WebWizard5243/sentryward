@@ -849,3 +849,37 @@ describe("GitHub token connections get their own repository hook", () => {
     expect((await prisma.repository.findUniqueOrThrow({ where: { id: enabled.body.repo.id } })).webhookId).toBeNull();
   });
 });
+
+describe("PATCH /api/repos/:id concurrency", () => {
+  it("creates only one forge hook when enabled twice at once", async () => {
+    const repo = await prisma.repository.create({
+      data: {
+        connectionId,
+        provider: "gitlab",
+        host: "gitlab.com",
+        fullPath: "team/api",
+        externalId: "2",
+        defaultBranch: "main",
+        enabled: false,
+      },
+    });
+
+    const stub = fetchStub([{ method: "POST", url: /\/projects\/2\/hooks$/, body: { id: 101 } }]);
+    // The delay lets both requests pass the "does a hook exist?" check before either saves.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (...args: Parameters<typeof fetch>) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return stub.fetch(...args);
+      }),
+    );
+
+    await Promise.all([
+      request(app).patch(`/api/repos/${repo.id}`).set("Cookie", cookie).send({ enabled: true }),
+      request(app).patch(`/api/repos/${repo.id}`).set("Cookie", cookie).send({ enabled: true }),
+    ]);
+
+    const hookCreates = stub.calls.filter((c) => c.method === "POST" && /\/hooks$/.test(c.url));
+    expect(hookCreates).toHaveLength(1);
+  });
+});
